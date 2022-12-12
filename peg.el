@@ -1,6 +1,6 @@
 ;;; peg.el --- Parsing Expression Grammars in Emacs Lisp  -*- lexical-binding:t -*-
 
-;; Copyright (C) 2008-2019  Free Software Foundation, Inc.
+;; Copyright (C) 2008-2022  Free Software Foundation, Inc.
 ;;
 ;; Author: Helmut Eller <eller.helmut@gmail.com>
 ;; Maintainer: Stefan Monnier <monnier@iro.umontreal.ca>
@@ -68,6 +68,8 @@
 ;;     Character classes	[ascii cntrl]
 ;;     Boolean-guard		(guard EXP)
 ;;     Syntax-Class		(syntax-class NAME)
+;;     Local definitions	(with RULES PEX...)
+;;     Indirect call            (funcall EXP ARGS...)
 ;; and
 ;;     Empty-string		(null)		ε
 ;;     Beginning-of-Buffer	(bob)
@@ -84,6 +86,26 @@
 ;; rules", all the way down to the "leaf rules" that deal with actual
 ;; buffer text.  Rules can be recursive or mutually referential,
 ;; though care must be taken not to create infinite loops.
+;;
+;;;; Named rulesets:
+;;
+;; You can define a set of rules for later use with:
+;;
+;;     (define-peg-ruleset myrules
+;;       (sign  () (or "+" "-" ""))
+;;       (digit () [0-9])
+;;       (nat   () digit (* digit))
+;;       (int   () sign digit (* digit))
+;;       (float () int "." nat))
+;;
+;; and later refer to it:
+;;
+;;     (with-peg-rules
+;;         (myrules
+;;          (complex float "+i" float))
+;;       ... (peg-parse nat "," nat "," complex) ...)
+;;
+;;;; Parsing actions:
 ;;
 ;; PEXs also support parsing actions, i.e. Lisp snippets which are
 ;; executed when a pex matches.  This can be used to construct syntax
@@ -143,7 +165,7 @@
 ;; pushes values to the stack without consuming any, and the latter
 ;; pops values from the stack and discards them.
 ;;
-;; Derived Operators:
+;;;; Derived Operators:
 ;;
 ;; The following operators are implemented as combinations of
 ;; primitive expressions:
@@ -194,7 +216,24 @@
 ;;
 ;; See ";;; Examples" in `peg-tests.el' for other examples.
 ;;
-;; References:
+;;;; Rule argument and indirect calls:
+;;
+;; Rules can take arguments and those arguments can themselves be PEGs.
+;; For example:
+;;
+;;     (define-peg-rule 2-or-more (peg)
+;;       (funcall peg)
+;;       (funcall peg)
+;;       (* (funcall peg)))
+;;
+;;     ... (peg-parse
+;;          ...
+;;          (2-or-more (peg foo))
+;;          ...
+;;          (2-or-more (peg bar))
+;;          ...)
+;;
+;;;; References:
 ;;
 ;; [Ford] Bryan Ford. Parsing Expression Grammars: a Recognition-Based
 ;; Syntactic Foundation. In POPL'04: Proceedings of the 31st ACM
@@ -214,6 +253,20 @@
 ;; - Fix the exponential blowup in `peg-translate-exp'.
 ;; - Add a proper debug-spec for PEXs.
 
+;;; News:
+
+;; Since 1.0.1:
+;; - Use OClosures to represent PEG rules when available, and let cl-print
+;;   display their source code.
+;; - New PEX form (with RULES PEX...).
+;; - Named rulesets.
+;; - You can pass arguments to rules.
+;; - New `funcall' rule to call rules indirectly (e.g. a peg you received
+;;   as argument).
+
+;; Version 1.0:
+;; - New official entry points `peg` and `peg-run`.
+
 ;;; Code:
 
 (eval-when-compile (require 'cl-lib))
@@ -230,6 +283,33 @@ It's a pair (POSITION . EXPS ...).  POSITION is the buffer position and
 EXPS is a list of rules/expressions that failed.")
 
 ;;;; Main entry points
+
+(defmacro peg--when-fboundp (f &rest body)
+  (declare (indent 1) (debug (sexp body)))
+  (when (fboundp f)
+    (macroexp-progn body)))
+
+(peg--when-fboundp oclosure-define
+  (oclosure-define peg-function
+    "Parsing function built from PEG rule."
+    pexs)
+
+  (cl-defmethod cl-print-object ((peg peg-function) stream)
+    (princ "#f<peg " stream)
+    (let ((args (help-function-arglist peg 'preserve-names)))
+      (if args
+          (prin1 args stream)
+        (princ "()" stream)))
+    (princ " " stream)
+    (prin1 (peg-function--pexs peg) stream)
+    (princ ">" stream)))
+
+(defmacro peg--lambda (pexs args &rest body)
+  (declare (indent 2)
+           (debug (&define form lambda-list def-body)))
+  (if (fboundp 'oclosure-lambda)
+      `(oclosure-lambda (peg-function (pexs ,pexs)) ,args . ,body)
+    `(lambda ,args . ,body)))
 
 ;; Sometimes (with-peg-rules ... (peg-run (peg ...))) is too
 ;; longwinded for the task at hand, so `peg-parse' comes in handy.
@@ -250,7 +330,7 @@ PEXS can also be a list of PEG rules, in which case the first rule is used."
   "Return a PEG-matcher that matches PEXS."
   (pcase (peg-normalize `(and . ,pexs))
     (`(call ,name) `#',(peg--rule-id name)) ;Optimize this case by η-reduction!
-    (exp `(lambda () ,(peg-translate-exp exp)))))
+    (exp `(peg--lambda ',pexs () ,(peg-translate-exp exp)))))
 
 ;; There are several "infos we want to return" when parsing a given PEX:
 ;; 1- We want to return the success/failure of the parse.
@@ -297,31 +377,65 @@ sequencing `and' operator of PEG grammars."
     (let ((id (peg--rule-id name))
           (exp (peg-normalize `(and . ,pexs))))
       `(progn
-         (,(if inline 'defsubst 'defun) ,id ,args
-          ,(if inline
-               ;; Short-circuit to peg--translate in order to skip the extra
-               ;; failure-recording of peg-translate-exp.  It also skips the
-               ;; cycle detection of peg--translate-rule-body, which is not the
-               ;; main purpose but we can live with it.
-               (apply #'peg--translate exp)
-             (peg--translate-rule-body name exp)))
+         (defalias ',id
+           (peg--lambda ',pexs ,args
+             ,(if inline
+                  ;; Short-circuit to peg--translate in order to skip
+                  ;; the extra failure-recording of `peg-translate-exp'.
+                  ;; It also skips the cycle detection of
+                  ;; `peg--translate-rule-body', which is not the main
+                  ;; purpose but we can live with it.
+                  (apply #'peg--translate exp)
+                (peg--translate-rule-body name exp))))
          (eval-and-compile
-           (put ',id 'peg--rule-definition ',exp))))))
+           ;; FIXME: We shouldn't need this any more since the info is now
+           ;; stored in the function, but sadly we need to find a name's EXP
+           ;; during compilation (i.e. before the `defalias' is executed)
+           ;; as part of cycle-detection!
+           (put ',id 'peg--rule-definition ',exp)
+           ,@(when inline
+               ;; FIXME: Copied from `defsubst'.
+               `(;; Never native-compile defsubsts as we need the byte
+                 ;; definition in `byte-compile-unfold-bcf' to perform the
+                 ;; inlining (Bug#42664, Bug#43280, Bug#44209).
+                 ,(byte-run--set-speed id nil -1)
+                 (put ',id 'byte-optimizer #'byte-compile-inline-expand))))))))
+
+(defmacro define-peg-ruleset (name &rest rules)
+  "Define a set of PEG rules for later use, e.g., in `with-peg-rules'."
+  (declare (indent 1))
+  (let ((defs ())
+        (aliases ()))
+    (dolist (rule rules)
+      (let* ((rname (car rule))
+             (full-rname (format "%s %s" name rname)))
+        (push `(define-peg-rule ,full-rname . ,(cdr rule)) defs)
+        (push `(,(peg--rule-id rname) #',(peg--rule-id full-rname)) aliases)))
+    `(cl-flet ,aliases
+       ,@defs
+       (eval-and-compile (put ',name 'peg--rules ',aliases)))))
 
 (defmacro with-peg-rules (rules &rest body)
   "Make PEG rules RULES available within the scope of BODY.
 RULES is a list of rules of the form (NAME . PEXS), where PEXS is a sequence
-of PEG expressions, implicitly combined with `and'."
+of PEG expressions, implicitly combined with `and'.
+RULES can also contain symbols in which case these must name
+rulesets defined previously with `define-peg-ruleset'."
   (declare (indent 1) (debug (sexp form))) ;FIXME: `sexp' is not good enough!
-  (let ((rules
-         ;; First, macroexpand the rules.
-         (mapcar (lambda (rule)
-                   (cons (car rule) (peg-normalize `(and . ,(cdr rule)))))
-                 rules))
+  (let* ((rulesets nil)
+         (rules
+          ;; First, macroexpand the rules.
+          (delq nil
+                (mapcar (lambda (rule)
+                          (if (symbolp rule)
+                              (progn (push rule rulesets) nil)
+                            (cons (car rule) (peg-normalize `(and . ,(cdr rule))))))
+                        rules)))
         (ctx (assq :peg-rules macroexpand-all-environment)))
     (macroexpand-all
      `(cl-labels
           ,(mapcar (lambda (rule)
+		     ;; FIXME: Use `peg--lambda' as well.
 		     `(,(peg--rule-id (car rule))
 		       ()
 		       ,(peg--translate-rule-body (car rule) (cdr rule))))
@@ -341,6 +455,10 @@ of PEG expressions, implicitly combined with `and'."
 
 (defun peg--lookup-rule (name)
   (or (cdr (assq name (cdr (assq :peg-rules macroexpand-all-environment))))
+      ;; With `peg-function' objects, we can recover the PEG from which it was
+      ;; defined, but this info is not yet available at compile-time.  :-(
+      ;;(let ((id (peg--rule-id name)))
+      ;;  (peg-function--pexs (symbol-function id)))
       (get (peg--rule-id name) 'peg--rule-definition)))
 
 (defun peg--rule-id (name)
@@ -381,14 +499,12 @@ of PEG expressions, implicitly combined with `and'."
   (apply #'peg--macroexpand exp))
 
 (defconst peg-leaf-types '(any call action char range str set
-			        guard syntax-class =))
+			   guard syntax-class = funcall))
 
 (cl-defgeneric peg--macroexpand (head &rest args)
   (cond
    ((memq head peg-leaf-types) (cons head args))
-   ((null args) `(call ,head))
-   (t
-    (error "Invalid parsing expression: %S" (cons head args)))))
+   (t `(call ,head ,@args))))
 
 (cl-defmethod peg--macroexpand ((_ (eql or)) &rest args)
   (cond ((null args) '(guard nil))
@@ -578,6 +694,9 @@ of PEG expressions, implicitly combined with `and'."
 	 (,@(peg--choicepoint-restore cp)
 	  ,(peg-translate-exp e2)))))
 
+(cl-defmethod peg--translate ((_ (eql with)) rules &rest exps)
+  `(with-peg-rules ,rules ,(peg--translate `(and . ,exps))))
+
 (cl-defmethod peg--translate ((_ (eql guard)) exp) exp)
 
 (defvar peg-syntax-classes
@@ -667,9 +786,11 @@ of PEG expressions, implicitly combined with `and'."
      (goto-char (match-end 0))
      t))
 
-(cl-defmethod peg--translate ((_ (eql call)) name)
-  ;; (peg--lookup-rule name) ;; Signal error if not found!
-  `(,(peg--rule-id name)))
+(cl-defmethod peg--translate ((_ (eql call)) name &rest args)
+  `(,(peg--rule-id name) ,@args))
+
+(cl-defmethod peg--translate ((_ (eql funcall)) exp &rest args)
+  `(funcall ,exp ,@args))
 
 (cl-defmethod peg--translate ((_ (eql action)) form)
   `(progn
@@ -696,7 +817,7 @@ of PEG expressions, implicitly combined with `and'."
 (defun peg-detect-cycles (exp path)
   "Signal an error on a cycle.
 Otherwise traverse EXP recursively and return T if EXP can match
-without consuming input.  Return nil if EXP definetly consumes
+without consuming input.  Return nil if EXP definitely consumes
 input.  PATH is the list of rules that we have visited so far."
   (apply #'peg--detect-cycles path exp))
 
